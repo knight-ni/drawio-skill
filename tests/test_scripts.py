@@ -720,6 +720,19 @@ class TestValidateFlowchartChecks(unittest.TestCase):
         self.assertNotIn("W-DECISION-EXIT", r.stdout)
         self.assertEqual(r.returncode, 0, r.stdout)
 
+    def test_decision_targetless_edge_is_not_an_exit(self):
+        # A second edge with source but no target must not count as an exit,
+        # else the dead branch hides behind a dangling stub.
+        xml = self._decision_page(1)[:-len("</root></mxGraphModel></diagram></mxfile>")]
+        xml += (
+            '<mxCell id="d2" edge="1" parent="1" source="d">'
+            '<mxGeometry relative="1" as="geometry"/></mxCell>'
+            "</root></mxGraphModel></diagram></mxfile>"
+        )
+        r = self._check(xml)
+        self.assertIn("W-DECISION-EXIT", r.stdout)
+        self.assertIn("decision 'd' has 1 distinct exit(s)", r.stdout)
+
     AS_LEAK = (
         '<mxfile><diagram name="P1"><mxGraphModel><root>'
         '<mxCell id="0"/><mxCell id="1" parent="0"/>'
@@ -908,6 +921,53 @@ class TestImportersCli(unittest.TestCase):
             self._write(os.path.join(d, "all.json"), json.dumps(self.K8S_LIST))
             graph = json.loads(run("k8simports.py", d, "--group").stdout)
             self.assertTrue(all(n["group"] == "shop" for n in graph["nodes"]))
+
+    def test_k8simports_skips_json_it_cannot_parse(self):
+        # A directory scan also finds JSON that is not a manifest, such as a
+        # tsconfig.json with comments: skip it with a warning, not a traceback.
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, "all.json"), json.dumps(self.K8S_LIST))
+            bad = os.path.join(d, "web", "tsconfig.json")
+            os.makedirs(os.path.dirname(bad))
+            self._write(bad, '{\n  // build options\n  "compilerOptions": {}\n}\n')
+            r = run("k8simports.py", d)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            ids = {n["id"] for n in json.loads(r.stdout)["nodes"]}
+            self.assertEqual(
+                ids, {"shop/Service/web", "shop/Deployment/web", "shop/ConfigMap/cfg"}
+            )
+            self.assertIn(f"warning: skipping {bad}", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_k8simports_skips_yaml_it_cannot_parse(self):
+        try:
+            import yaml  # noqa: F401
+        except ImportError:
+            self.skipTest("PyYAML not installed")
+        # A Helm chart's templates are not YAML until they are rendered.
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, "all.json"), json.dumps(self.K8S_LIST))
+            tpl = os.path.join(d, "chart", "templates", "deployment.yaml")
+            os.makedirs(os.path.dirname(tpl))
+            self._write(
+                tpl,
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n"
+                '  name: {{ include "app.fullname" . }}\n  labels:\n'
+                '    {{- include "app.labels" . | nindent 4 }}\n',
+            )
+            r = run("k8simports.py", d)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(len(json.loads(r.stdout)["nodes"]), 3)
+            self.assertIn(f"warning: skipping {tpl}", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_k8simports_fails_when_every_file_is_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._write(os.path.join(d, "tsconfig.json"), "{ // nope\n}")
+            r = run("k8simports.py", d)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("no Kubernetes objects found", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
 
     def test_composeimports_edges(self):
         try:
@@ -1609,6 +1669,42 @@ class TestImportersCli(unittest.TestCase):
         self.assertEqual(tables["tickets"]["fks"], [("customer_id", "customers")])
         self.assertEqual(tables["commented"]["fks"], [])
         self.assertIn("id", tables["commented"]["pks"])
+
+    def test_sqlerd_quoted_column_names_with_spaces(self):
+        sql = """
+        CREATE TABLE products (id INT PRIMARY KEY);
+        CREATE TABLE orders (
+          "Order Id" INTEGER NOT NULL,
+          `Unit Price` DECIMAL(10,2),
+          [Product Id] INT REFERENCES products(id),
+          PRIMARY KEY ("Order Id")
+        );
+        """
+        orders = load("sqlerd").parse_tables(sql)["orders"]
+        self.assertEqual(
+            orders["columns"],
+            [("order id", "INTEGER"), ("unit price", "DECIMAL(10,2)"), ("product id", "INT")],
+        )
+        self.assertEqual(orders["pks"], {"order id"})
+        self.assertEqual(orders["fks"], [("product id", "products")])
+
+    def test_sqlerd_quoted_column_name_is_not_a_keyword(self):
+        sql = """
+        CREATE TABLE notes (
+          "Primary Key" TEXT,
+          "references x" TEXT,
+          "Due Date"DATE,
+          id INT PRIMARY KEY
+        );
+        """
+        notes = load("sqlerd").parse_tables(sql)["notes"]
+        self.assertEqual(
+            notes["columns"],
+            [("primary key", "TEXT"), ("references x", "TEXT"), ("due date", "DATE"),
+             ("id", "INT")],
+        )
+        self.assertEqual(notes["pks"], {"id"})
+        self.assertEqual(notes["fks"], [])
 
     def test_seqlayout_geometry(self):
         spec = {
