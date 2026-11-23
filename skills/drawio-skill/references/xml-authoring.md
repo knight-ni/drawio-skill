@@ -26,7 +26,12 @@ Read this **before hand-writing any `.drawio` XML** (workflow step 3). Skip it w
 - All shapes have `parent="1"` (unless inside a container — then use container's id)
 - All text uses `html=1` in style for proper rendering
 - **Never use `--` inside XML comments** — it's illegal per XML spec and causes parse errors
-- Escape special characters in attribute values: `&amp;`, `&lt;`, `&gt;`, `&quot;`
+- When writing XML by hand, escape attribute characters. With ElementTree or
+  `quoteattr`, pass the composed label once. Escape user text for its HTML
+  text context separately, then add the actual formatting elements. For
+  example, a decoded `html=1` value may read `R&amp;D<br><span style="font-size:9px">[Ops]</span>`.
+  Check the viewer's visible text for both lines. Literal examples of HTML
+  markup can be displayed deliberately inside `<code>` or `<pre>`.
 - **Multi-line text in labels:** use `&#xa;` for line breaks inside `value` attributes (not literal `\n`). Example: `value="Line 1&#xa;Line 2"`
 
 ### SVG text labels
@@ -214,6 +219,20 @@ Rules: swatch colors come from the active palette (preset or the table above) wi
 - When an edge must span multiple rows/columns, route it along the outer corridor, not through the middle of the diagram
 
 ### Decision-diamond branches, pixel-exact pins, and labels
+
+For a revision with stable IDs, record the requested destinations before
+generating the current page. Run `python3 scripts/validate.py steps.drawio
+--expect-flow expected.json`. A decision may send the same outcome to two
+destinations. This example also checks the following step and a retired ID.
+
+~~~json
+{"page":"Current","outgoing":{"review":[["Yes","release"],["No","rework"],["No","notify"]],"notify":[["","record"]]},"removed":["old-review"]}
+~~~
+
+Use the exact edge label as stored in the decoded XML, including an empty
+string on an unlabeled edge. A different, retained reference page can still
+document the original flow. Check any editable table against the same
+outcomes and step IDs.
 
 Pitfalls verified from rendered output. `validate.py` does not catch any of them, and vision review both misses them and hallucinates new ones (it once described a clean diamond exit as "wrapping around the box" and approved a screenshot that was actually the browser error page).
 

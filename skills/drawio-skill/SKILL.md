@@ -73,15 +73,28 @@ path it found. The bundled exporters resolve it themselves, so a name mismatch
 (`drawio` vs `draw.io.exe`) no longer blocks them.
 
 1. Infer the diagram type, audience, scope, output format, and location from the
-   request. Ask only when a missing choice materially changes the result;
-   default to PNG plus `.drawio` in the working directory.
+   request. Honor a named primary format. When users need to edit steps in a
+   commonly available application and convert to draw.io later, a spreadsheet
+   with stable step IDs, owners, conditions and destinations can be the editable
+   primary file. Native draw.io or its web editor is appropriate when requested.
+   For a new diagram with no format preference, default to a PNG plus its
+   editable `.drawio` in the working directory.
 2. Select the authoring route from the table above. For a data-backed diagram,
    prefer Diagram IR and preserve provenance. For a large graph, use an importer
    or `autolayout.py`; do not hand-place more than roughly fifteen nodes.
 3. Resolve an explicitly named style preset, or the user's default preset, as
    documented in `references/style-presets.md`. Structural diagram conventions
    and visual presets compose; they do not replace each other.
-4. Generate the `.drawio`, then run structural validation:
+4. For a process revision, read the latest instructions and attachment together.
+   List the decisions being replaced and the complete destinations for each
+   outcome, including parallel actions and their order. Read them back from
+   the saved diagram edges and any current editable table, using step IDs.
+   Check that removed decisions disappear from current views. Identify any
+   explicitly preserved reference page by name. Carry the requested lane
+   headers, orientation and colour treatment into the exported view.
+   For changed branches, pass those independently specified expectations to
+   `validate.py --expect-flow expected.json` as described in
+   `references/xml-authoring.md`. Then run structural validation:
 
    ```bash
    python3 scripts/validate.py diagram.drawio --score
@@ -90,7 +103,10 @@ path it found. The bundled exporters resolve it themselves, so a name mismatch
    When semantic metadata or an architecture policy is in scope, also run
    `diagramctl.py test`. Do not present inferred semantic findings as verified
    runtime facts.
-5. Export a draft PNG without embedded XML and inspect it visually. Fix obvious
+5. Read back visible labels, including department lines, in the requested
+   viewer or a local export using that renderer. Compare the text to the
+   source labels. Treat a different renderer as a separate verification result.
+   Export a draft PNG without embedded XML and inspect it visually. Fix obvious
    overlap, clipping, disconnected edges, edge-through-node routing, stacked
    edges, and unreadable labels. Stop automatic vision repair after two rounds.
    When the drawio binary is unavailable or a visual check is inconclusive,

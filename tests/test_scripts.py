@@ -420,10 +420,67 @@ class TestValidateCli(unittest.TestCase):
     def test_good_passes(self):
         self.assertEqual(self._check(self.GOOD).returncode, 0)
 
+    def test_html_label_rendered_as_literal_formatting(self):
+        from xml.sax.saxutils import quoteattr
+
+        # Same two serialization layers as the failed department label.
+        bad = "Review&#xa;&lt;font style=&quot;font-size:9px&quot;&gt;[Ops]&lt;/font&gt;"
+        numeric = "Review&#10;&#60;span style='font-size:9px'&#62;[Ops]&#60;/span&#62;"
+        for xml in (self.GOOD, self.LINKED.replace('<mxCell vertex=', '<mxCell style="html=1;" vertex=')):
+            attribute = 'label' if '<UserObject' in xml else 'value'
+            for label in (bad, numeric):
+                field = f'{attribute}={quoteattr(label)}'
+                if attribute == 'value':
+                    field += ' style="html=1;"'
+                with self.subTest(attribute=attribute, label=label):
+                    result = self._check(xml.replace(f'{attribute}="A"', field))
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn('E-LABEL-ESCAPE', result.stdout)
+
+    def test_html_label_keeps_valid_formatting_and_literal_examples(self):
+        from xml.sax.saxutils import quoteattr
+
+        cases = [
+            ("A &amp; B<br><font style='font-size:9px'>[Ops]</font>", "html=1;"),
+            ("A &lt; B, font-size is a CSS property", "html=1;"),
+            ("Example:<pre>&lt;font style='font-size:9px'&gt;A&lt;/font&gt;</pre>", "html=1;"),
+            ("Example:<br><code>&lt;span style='color:red'&gt;A&lt;/span&gt;</code>", "html=1;"),
+            ("Write &lt;tag&gt; or A&amp;B", "html=1;"),
+            ("Example\n<font style='font-size:9px'>A</font>", "html=0;"),
+            ("Review&#10;&lt;font size='2'&gt;A&lt;/font&gt;", "html=1;html=0;"),
+        ]
+        for label, style in cases:
+            with self.subTest(label=label):
+                result = self._check(self.GOOD.replace('value="A"', f'value={quoteattr(label)} style="{style}"'))
+                self.assertEqual(result.returncode, 0, result.stdout)
+
     def test_dangling_edge_fails(self):
         r = self._check(self.BAD)
         self.assertEqual(r.returncode, 1)
         self.assertIn("error", r.stdout)
+
+    def test_declared_outcomes_are_exact_and_scoped_to_current_page(self):
+        import json
+
+        extra = ('<mxCell id="parallel" edge="1" parent="1" source="2" target="3" value="also">'
+                 '<mxGeometry relative="1" as="geometry"/></mxCell>')
+        current = self.GOOD.replace('</root>', extra + '</root>')
+        ref = self.GOOD.split('<mxfile>')[1].split('</mxfile>')[0].replace('P1', 'Reference')
+        reference = ref.replace('id="2" value="A"', 'id="retired" value="A"').replace('source="2"', 'source="retired"')
+        with tempfile.TemporaryDirectory() as folder:
+            from pathlib import Path
+            diagram, expectations = Path(folder, 'steps.drawio'), Path(folder, 'expected.json')
+            contract = {'page': 'P1', 'outgoing': {'2': [['', '3'], ['also', '3']]}, 'removed': ['retired']}
+            expectations.write_text(json.dumps(contract))
+            for xml, finding in ((current, None), (self.GOOD, 'E-FLOW-OUTCOMES'),
+                                 (current.replace('id="parallel"', 'id="retired"'), 'E-FLOW-RETIRED'),
+                                 (current.replace('name="P1"', 'name="Renamed"'), 'E-FLOW-PAGE')):
+                with self.subTest(finding=finding):
+                    diagram.write_text(xml.replace('</mxfile>', reference + '</mxfile>'))
+                    result = run("validate.py", str(diagram), "--expect-flow", str(expectations), "--json")
+                    self.assertEqual(result.returncode, int(finding is not None), result.stderr)
+                    if finding:
+                        self.assertIn(finding, result.stdout)
 
     def test_findings_carry_code_and_fix(self):
         # Structured-diagnostic format: stable [CODE] + a (fix: ...) hint an

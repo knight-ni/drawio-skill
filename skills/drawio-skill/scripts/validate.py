@@ -42,10 +42,36 @@ Usage: python3 validate.py <file.drawio> [--strict] [--json]
 """
 import argparse
 import json
+import re
 import sys
 import xml.etree.ElementTree as ET
+from html.parser import HTMLParser
 
 RESERVED = {"0", "1"}
+
+
+class LabelText(HTMLParser):
+    """Find a formatting-only line that the HTML viewer will display literally."""
+    formatting_line = re.compile(
+        r"(?:^|\n)[ \t]*<(font|span)\s+[^<>\n]*\b(?:style|size|color|face)\s*="
+        r"[^<>\n]*>[^<>\n]+</\1\s*>[ \t]*(?=\n|$)", re.I)
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.example_depth = 0
+        self.leaked = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("code", "pre", "samp"):
+            self.example_depth += 1
+
+    def handle_endtag(self, tag):
+        if tag in ("code", "pre", "samp") and self.example_depth:
+            self.example_depth -= 1
+
+    def handle_data(self, data):
+        if not self.example_depth and self.formatting_line.search(data):
+            self.leaked = True
 
 
 def diag(code, severity, subject, message, fix):
@@ -288,7 +314,29 @@ def geometry_warnings(cells, ids, parents):
     return warns
 
 
-def check_page(diagram):
+def flow_expectations(path):
+    with open(path, encoding="utf-8-sig") as source:
+        spec = json.load(source)
+    if not isinstance(spec, dict) or set(spec) - {"page", "outgoing", "removed"}:
+        raise ValueError("expected page, outgoing and optional removed keys")
+    page = spec.get("page")
+    outgoing = spec.get("outgoing")
+    removed = spec.get("removed", [])
+    if not isinstance(page, str) or not page or not isinstance(outgoing, dict):
+        raise ValueError("expected a named page and an outgoing object")
+    if not isinstance(removed, list) or not all(isinstance(s, str) and s for s in removed):
+        raise ValueError("removed must contain stable cell IDs")
+    if not outgoing and not removed:
+        raise ValueError("specify at least one expected node or removed ID")
+    for node, edges in outgoing.items():
+        if not node or not isinstance(edges, list) or not all(
+                isinstance(e, list) and len(e) == 2 and isinstance(e[0], str)
+                and isinstance(e[1], str) and e[1] for e in edges):
+            raise ValueError("each outgoing edge must be [label, destination ID]")
+    return spec
+
+
+def check_page(diagram, expected=None):
     """Return (errors, warnings) for one <diagram> page, as structured findings."""
     name = diagram.get("name", "?")
     model = diagram.find("mxGraphModel")
@@ -313,6 +361,8 @@ def check_page(diagram):
             inner = child.find("mxCell")
             if inner is not None:
                 inner.set("id", child.get("id", ""))
+                if "label" in child.attrib:
+                    inner.set("value", child.get("label"))
                 cells.append(inner)
     errors, warns = [], []
     ids = {}
@@ -324,6 +374,26 @@ def check_page(diagram):
                                "give each cell a unique id"))
         ids[cid] = c
     parents = {c.get("parent") for c in cells}            # ids that have children
+    for c in cells:
+        value = c.get("value", "")
+        if "&" not in value or not re.search(r"&(?:lt;|#(?:0*60|x0*3c);)", value, re.I):
+            continue
+        html = next((s for s in reversed(c.get("style", "").split(";")) if s.startswith("html=")), "")
+        if html == "html=1":
+            label = LabelText()
+            try:
+                label.feed(value)
+                label.close()
+            except (AssertionError, ValueError):
+                warns.append(diag("W-LABEL-HTML", "warning", c.get("id"),
+                                  f"cannot inspect the HTML label of cell {c.get('id')!r}",
+                                  "compare its visible text in the target editor"))
+                continue
+            if label.leaked:
+                errors.append(diag(
+                    "E-LABEL-ESCAPE", "error", c.get("id"),
+                    f"page {name!r}, cell {c.get('id')!r} displays its formatting tag as text",
+                    "pass the HTML label to the XML serializer once; mark literal examples as code"))
     for c in cells:
         cid, parent = c.get("id"), c.get("parent")
         is_v, is_e = c.get("vertex") == "1", c.get("edge") == "1"
@@ -406,6 +476,22 @@ def check_page(diagram):
                     "a decision needs one branch per outcome — add the "
                     "missing outgoing edge(s)"))
 
+    if expected is not None:
+        observed = {node: [] for node in expected["outgoing"]}
+        for cell in cells:
+            source = cell.get("source")
+            if cell.get("edge") == "1" and source in observed:
+                observed[source].append([cell.get("value", ""), cell.get("target", "")])
+        for node, edges in expected["outgoing"].items():
+            if node not in ids or sorted(observed[node]) != sorted(edges):
+                errors.append(diag("E-FLOW-OUTCOMES", "error", node,
+                                   f"page {name!r}, {node!r}: expected exits {edges!r}, found {observed[node]!r}",
+                                   "reconcile every outcome and parallel destination with the revision"))
+        for retired in expected.get("removed", []):
+            if retired in ids:
+                errors.append(diag("E-FLOW-RETIRED", "error", retired,
+                                   f"page {name!r} retains retired cell {retired!r}",
+                                   "remove the superseded step from this current view"))
     warns += geometry_warnings(cells, ids, parents)
     return errors, warns
 
@@ -421,6 +507,8 @@ def main():
     ap.add_argument("--strict", action="store_true", help="treat warnings as failure too")
     ap.add_argument("--json", action="store_true",
                     help="emit findings as structured JSON instead of prose lines")
+    ap.add_argument("--expect-flow", metavar="JSON",
+                    help="verify declared outcomes and removed IDs in a named revision page")
     ap.add_argument("--score", action="store_true",
                     help="also print a readability score (lower is better) — "
                          "useful for comparing layout variants of the same graph")
@@ -431,8 +519,20 @@ def main():
         sys.exit(f"error: cannot parse {args.file}: {exc}")
     pages = tree.getroot().findall("diagram") or [tree.getroot()]
     errors, warns = [], []
+    expected = None
+    if args.expect_flow:
+        try:
+            expected = flow_expectations(args.expect_flow)
+        except (ValueError, OSError) as exc:
+            ap.error(f"cannot use flow expectations: {exc}")
+        selected = [p for p in pages if p.get("name") == expected["page"]]
+        if len(selected) != 1 or selected[0].find("mxGraphModel/root") is None:
+            errors.append(diag("E-FLOW-PAGE", "error", expected["page"],
+                               "expected revision page is missing, ambiguous or compressed",
+                               "select exactly one current page and save it as uncompressed XML"))
+            expected = None
     for page in pages:
-        e, w = check_page(page)
+        e, w = check_page(page, expected if expected and page.get("name") == expected["page"] else None)
         errors += e
         warns += w
     if args.json:
