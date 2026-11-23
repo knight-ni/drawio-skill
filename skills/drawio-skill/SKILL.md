@@ -100,6 +100,10 @@ path it found. The bundled exporters resolve it themselves, so a name mismatch
    python3 scripts/validate.py diagram.drawio --score
    ```
 
+   Before delivering native draw.io files, check the actual file or ZIP that
+   the reader will receive with `validate.py --label-escape-only <file-or-zip>`.
+   This checks formatting labels on every native page, including compressed pages.
+
    When semantic metadata or an architecture policy is in scope, also run
    `diagramctl.py test`. Do not present inferred semantic findings as verified
    runtime facts.

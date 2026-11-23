@@ -41,11 +41,16 @@ skipped with a warning — this skill always writes uncompressed XML.
 Usage: python3 validate.py <file.drawio> [--strict] [--json]
 """
 import argparse
+import base64
 import json
 import re
 import sys
+import urllib.parse
 import xml.etree.ElementTree as ET
+import zipfile
+import zlib
 from html.parser import HTMLParser
+from pathlib import Path
 
 RESERVED = {"0", "1"}
 
@@ -336,7 +341,7 @@ def flow_expectations(path):
     return spec
 
 
-def check_page(diagram, expected=None):
+def check_page(diagram, expected=None, labels_only=False):
     """Return (errors, warnings) for one <diagram> page, as structured findings."""
     name = diagram.get("name", "?")
     model = diagram.find("mxGraphModel")
@@ -394,6 +399,8 @@ def check_page(diagram, expected=None):
                     "E-LABEL-ESCAPE", "error", c.get("id"),
                     f"page {name!r}, cell {c.get('id')!r} displays its formatting tag as text",
                     "pass the HTML label to the XML serializer once; mark literal examples as code"))
+    if labels_only:
+        return [e for e in errors if e["code"] == "E-LABEL-ESCAPE"], warns
     for c in cells:
         cid, parent = c.get("id"), c.get("parent")
         is_v, is_e = c.get("vertex") == "1", c.get("edge") == "1"
@@ -501,9 +508,67 @@ def render(d, severity):
     return f"{severity}: [{d['code']}] {d['message']} (fix: {d['fix']})"
 
 
+class DeliveredLabels:
+    """Inspect actual native drawing bytes, including raw-deflate diagram pages."""
+
+    per_item = 32 * 1024 * 1024
+
+    def __init__(self):
+        self.remaining = 128 * 1024 * 1024
+
+    def consume(self, data):
+        if len(data) > min(self.per_item, self.remaining):
+            raise ValueError("drawing or decoded page exceeds 32 MiB, or batch exceeds 128 MiB; split pages or submit smaller batches")
+        self.remaining -= len(data)
+        return data
+
+    def inspect(self, stream, source):
+        document = ET.fromstring(self.consume(stream.read(min(self.per_item, self.remaining) + 1)))
+        if document.tag not in ("mxfile", "diagram", "mxGraphModel"):
+            raise ValueError("not a native draw.io document; save the editable diagram as .drawio")
+        pages = document.findall("diagram") if document.tag == "mxfile" else [document]
+        if not pages:
+            raise ValueError("native drawing contains no pages; save it again as .drawio")
+        for index, page in enumerate(pages, 1):
+            model = page if page.tag == "mxGraphModel" else page.find("mxGraphModel")
+            if model is None and page.tag == "diagram" and (page.text or "").strip():
+                compressed = base64.b64decode("".join(page.text.split()), validate=True)
+                inflater = zlib.decompressobj(-15)
+                encoded = self.consume(inflater.decompress(compressed, min(self.per_item, self.remaining) + 1))
+                if not inflater.eof or inflater.unused_data:
+                    raise ValueError("incomplete compressed diagram; save as uncompressed .drawio")
+                model = ET.fromstring(urllib.parse.unquote_to_bytes(encoded))
+            if model is None or model.tag != "mxGraphModel":
+                raise ValueError("unreadable native drawing page; save as uncompressed .drawio")
+            wrapper = ET.Element("diagram", name=str(index))
+            wrapper.append(model)
+            errors, warnings = check_page(wrapper, labels_only=True)
+            if errors or warnings:
+                finding = (errors or warnings)[0]
+                member = f"{source}, " if source else ""
+                raise ValueError(f"{member}page {index}, cell {finding['subject']}: [{finding['code']}] {finding['fix']}")
+
+    def check(self, path):
+        if path.suffix.lower() != ".zip":
+            with path.open("rb") as stream:
+                self.inspect(stream, "")
+            return
+        with zipfile.ZipFile(path) as archive:
+            for entry in archive.infolist():
+                if entry.is_dir() or not entry.filename.lower().endswith(".drawio"):
+                    continue
+                if entry.file_size > min(self.per_item, self.remaining):
+                    raise ValueError("drawing member exceeds inspection budget; split pages or submit a smaller batch")
+                with archive.open(entry) as stream:
+                    self.inspect(stream, entry.filename)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Lint a .drawio file for structural errors.")
     ap.add_argument("file")
+    ap.add_argument("more_files", nargs="*", help=argparse.SUPPRESS)
+    ap.add_argument("--label-escape-only", action="store_true",
+                    help="check reader-visible formatting labels in native .drawio files or their ZIP members")
     ap.add_argument("--strict", action="store_true", help="treat warnings as failure too")
     ap.add_argument("--json", action="store_true",
                     help="emit findings as structured JSON instead of prose lines")
@@ -513,6 +578,18 @@ def main():
                     help="also print a readability score (lower is better) — "
                          "useful for comparing layout variants of the same graph")
     args = ap.parse_args()
+    if args.label_escape_only:
+        if args.strict or args.json or args.expect_flow or args.score:
+            ap.error("--label-escape-only is a separate delivery check")
+        labels = DeliveredLabels()
+        for filename in [args.file, *args.more_files]:
+            try:
+                labels.check(Path(filename))
+            except (OSError, ValueError, RuntimeError, ET.ParseError, zlib.error, zipfile.BadZipFile) as exc:
+                sys.exit(f"{Path(filename).name}: {exc}")
+        return
+    if args.more_files:
+        ap.error("multiple files require --label-escape-only")
     try:
         tree = ET.parse(args.file)
     except (ET.ParseError, OSError) as exc:
